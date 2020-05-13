@@ -424,7 +424,7 @@ def norm(vectors):
     return np.array(norm_vectors)
 
 def get_random_vectors(dim,m):
-    vectors = np.random.random((m, dim))
+    vectors = np.random.randn(m, dim)
     return norm(vectors)
 
 def compute_hash(docs, rnd_vec, t):
