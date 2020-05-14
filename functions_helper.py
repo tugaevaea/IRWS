@@ -174,6 +174,35 @@ def tf_idf_to_matrix(tf_idf_dict):
                                            orient = 'index').fillna(0) # if word does not appear in doc we change NaN to
     return tf_idf_matrix.sort_index()
 
+#create tf-idf matrix for queries
+def queries_tf_idf(tf_idf_matrix, idf_dict, queries, tokenize = True):
+    #create tf-idf matrix of queries
+    tf_idf_queries = tf_idf_matrix[0:0]
+    
+    for i in range(len(queries)):
+        tf_idf_queries = tf_idf_queries.append(pd.Series(0, index=tf_idf_queries.columns), ignore_index=True)
+        #count occurances
+        if tokenize:
+            for token in (queries['TEXT'][i]):
+                for col in tf_idf_queries.columns:
+                    if token == col:
+                        tf_idf_queries[col][i] = tf_idf_queries[col][i] + 1
+        else: 
+            for token in (queries['TEXT'][i]).split():
+                for col in tf_idf_queries.columns:
+                    if token == col:
+                        tf_idf_queries[col][i] = tf_idf_queries[col][i] + 1
+                
+    #calculate log tf
+    tf_idf_queries = np.log(tf_idf_queries) + 1 
+    tf_idf_queries = tf_idf_queries.replace(-np.inf,0)
+    
+    for i in range(len(queries)):
+        for col in tf_idf_queries.columns:
+            tf_idf_queries[col][i] = tf_idf_queries[col][i] * idf_dict[col]
+    
+    return tf_idf_queries
+
 ################################################################################
 ## Cosine similarity
 ################################################################################
