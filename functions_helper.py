@@ -10,7 +10,12 @@ from nltk.stem import PorterStemmer
 import string
 import re
 import time
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+import collections
 
+import nltk
+nltk.download('punkt')
 ################################################################################
 ## DATA preprocessing
 ################################################################################
@@ -31,7 +36,7 @@ def preprocess_corpus(data):
     return data
 
 
-def preprocess_queries(corpus, queries, output_string=False):
+def preprocess_queries(corpus, queries, output_string = False):
     def remove_punctuations(text):  # remove punctuation
         for punctuation in string.punctuation:
             text = text.replace(punctuation, '')
@@ -78,13 +83,15 @@ def preprocess_queries(corpus, queries, output_string=False):
             if token in v:
                 t.append(token)
         return t
-
+       
     def create_string(tokens):
         s = []
         for token in tokens:
             s.append(token)
             s.append(" ")
         return "".join(s)
+
+    
 
     # apply functions
     queries['TEXT'] = queries.apply(lambda x: remove_punctuations(x['TEXT']), axis=1)
@@ -98,8 +105,9 @@ def preprocess_queries(corpus, queries, output_string=False):
         queries['TEXT'] = queries.apply(lambda x: create_string(x['TEXT']),
                                         axis=1)  # we need a string because pandas.Datarame.isin
     # function is not working with unhashable objects
-
     return queries
+
+
 ################################################################################
 ## TF-IDF calculations
 ################################################################################
@@ -218,6 +226,443 @@ def cosine_similarity(v1, v2):
     return dot_product(v1, v2) / (vector_magnitude(v1) * vector_magnitude(v2))
 
 ################################################################################
+## Tiered index
+################################################################################
+
+
+################################################################################
+## Pre-clustering
+################################################################################
+
+def allocate_docs_to_clusters(rs, sqrt_n, cosine = False, Faiss = False):
+    
+    def set_leaders(random_state = rs):
+        #Set number of clusters at initialisation time
+        #sqrt_n = round(math.sqrt(no_of_docs))
+        #we randomly select sqrt(N) documents from the corpus, which we call leaders
+        leaders = tf_idf_matrix.sample(sqrt_n, random_state = rs)
+        leaders = leaders.sort_index()
+        return leaders
+
+    leaders = set_leaders(random_state = rs)
+    
+    # For every other document in the collection
+    # 1. Compute the similarities (cosine of the angle between TF-IDF vectors) with all leaders
+    # 2. Add the document to the cluster of the most similar leader
+    if (cosine and Faiss) or ((not cosine) and (not Faiss)):
+        print('both true')
+        return [], []
+    
+    
+    elif cosine == True:
+        cluster_list = []
+
+        for i in range(sqrt_n):
+            cluster_list.append([])
+
+        for i in range(no_of_docs):
+            cosines = []
+            for j in leaders.index:
+                cosines.append(cosine_similarity(tf_idf_matrix.loc[i],leaders.loc[j]))
+            m = max(cosines)
+            index_of_max = [l for l, b in enumerate(cosines) if b == m]
+            cluster_list[index_of_max[0]].append(i) #if there are two equal max values of cosine similarity use the smaller index by default
+        return leaders, cluster_list
+    
+    elif Faiss == True:
+        
+        leaders = leaders.astype('float32')
+        index = faiss.IndexFlatL2(len(leaders.columns))
+        index.add(np.ascontiguousarray(leaders.values))
+        
+        cluster_list = []
+
+        for i in range(sqrt_n):
+            cluster_list.append([])
+
+        for i in range(no_of_docs):
+            doc = np.array([tf_idf_matrix.loc[i]])
+            D, I = index.search(doc, 1)
+            cluster_list[I[0][0]].append(i)
+        
+        return leaders, cluster_list
+    
+    else:
+        print('exeption')
+        return [],[]
+
+###########################
+## Basic pre-clustering
+###########################
+
+#construct function, which uses query q(should be already in the vector form) as input, required similarity of the doc to be retrieved - threshold, and
+#necessary number of documents to be retrieved - K (5 most similar docs in the cluster by default)
+
+def ir_preclustering(q, threshold = 0, K = 5): 
+    
+    sim_to_leaders = [] #array of cosine similarities of q to leaders
+    retrieved_docs = [] #array of the most similar docs to be returned by the function
+    
+    for i in range(len(leaders.index)):
+        sim_to_leaders.append(cosine_similarity(q,leaders.iloc[i]))
+        m = max(sim_to_leaders)
+        index_of_max = [l for l, b in enumerate(sim_to_leaders) if b == m] #odinal number of most similar leader => use this cluster
+    
+    sim_to_docs = [] #array of cosine similarities of q to all docs in the chosen cluster
+    for doc in cluster_list[index_of_max[0]]:
+        sim_to_docs.append(cosine_similarity(q,tf_idf_matrix.iloc[doc]))
+        
+    ins = np.argsort(sim_to_docs) #returns the indices that would sort an array of similarities to docs in ascending order
+    ins = ins[::-1] #but we need descending (most similar in the beginning of the list)
+    
+    if threshold == 0: #proceed only with K
+        if len(ins)>=K:
+            for k in range(K):
+                retrieved_docs.append(cluster_list[index_of_max[0]][ins[k]])
+        else:
+            K=len(ins)
+            for k in range(K):
+                retrieved_docs.append(cluster_list[index_of_max[0]][ins[k]])
+
+        
+    else:
+        if sim_to_docs[ins[0]] < threshold:
+            print('no documents satisfy necessary level of threshold similarity')
+            return None
+        
+        for sim in sim_to_docs:
+            if sim >= threshold:
+                retrieved_docs.append(cluster_list[index_of_max[0]][sim_to_docs.index(sim)])
+            if len(retrieved_docs) < K:
+                print('number of documents that satisfy threshold similarity is less than required \(less than K\)')
+    
+    return corpus.iloc[retrieved_docs]
+
+def retrieve_with_preclustering(string_query, k = 5, IDs_of_retrieved_docs = False):
+    vector_q = vectorize_query(string_query)
+    return ir_preclustering(vector_q.iloc[0], K = k)
+
+def evaluate_retrieve_with_preclustering(position):
+    
+    ## takes ordinal number of a query as an input 
+    ## returns the triple (Precision, Average Precision, Normalized Discounted Cumulative Gain)
+    
+    retrieved_df = ir_preclustering(tf_idf_queries.iloc[position])
+    ids_retrieved = []
+    for i in range(len(retrieved_df)):
+        ids_retrieved.append(retrieved_df.iloc[i].ID)
+    ids_retrieved.sort()
+    
+    relevant = true_relevant_docs(queries_text['TEXT'][position])
+    ids_true_relevant = []
+    for i in range(len(relevant)):
+        ids_true_relevant.append(relevant.iloc[i].DOC_ID)
+    ids_true_relevant.sort()
+    
+    #count true positives and false positives
+    tp = 0
+    fp = 0
+    for i in ids_retrieved:
+        for j in ids_true_relevant:
+            if i == j:
+                tp += 1 
+                break
+            else:
+                if i < j:
+                    fp += 1 
+                    break
+                else:
+                    continue
+    if (tp == 0) & (fp == 0):
+        precision = 0
+    else:
+        precision = tp/(tp+fp)
+    #cannot calculate recall, since we predefined the number of retrieved documents => apriori algorithm cannot retrieve all documents
+    
+    #then calculate Average precision across retrieved documents
+    ap = apk(ids_true_relevant, ids_retrieved)
+    
+    #since we have graded relevance annotations, we can also calculate Normalized Discounted Cumulative Gain
+    list_of_ranks_of_retrieved_docs = []
+    for i in ids_retrieved:
+        if i in ids_true_relevant:
+            list_of_ranks_of_retrieved_docs.append(relevant.loc[relevant['DOC_ID'].isin([i])].RELEVANCE_LEVEL.iloc[0])
+        else:
+            list_of_ranks_of_retrieved_docs.append(0)
+
+                                               
+    list_of_ranks_of_relevant_docs = []
+    for i in ids_true_relevant:
+        list_of_ranks_of_relevant_docs.append(relevant.loc[relevant['DOC_ID'].isin([i])].RELEVANCE_LEVEL.iloc[0])
+    list_of_ranks_of_relevant_docs.sort(reverse = True)
+    
+    k=len(list_of_ranks_of_retrieved_docs)
+    list_of_ranks_of_relevant_docs = list_of_ranks_of_relevant_docs[:k]
+        
+    return precision, ap, ndcg(list_of_ranks_of_relevant_docs, list_of_ranks_of_retrieved_docs)       
+                
+    
+
+    
+
+###########################
+## Faiss pre-clustering
+###########################
+def set_indeces_for_faiss():
+    index = faiss.IndexFlatL2(len(leaders.columns))
+    index.add(np.ascontiguousarray(leaders.values))
+    
+    indices = []
+    for i in range(len(leaders)):
+        index2 = faiss.IndexFlatL2(len(leaders.columns))
+        index2.add(np.ascontiguousarray(tf_idf_matrix.loc[cluster_list[i]]))
+        indices.append(index2)
+        
+    return index, indices
+
+
+#find the nearest leader
+def ir_preclustering_faiss(q, K = 5, threshold = 0):
+    
+    
+
+    q = np.array([q])
+    D, I = index.search(q, 1) #returning distance and index of the nearest leader
+    
+    index2 = indices[I[0][0]]
+    
+    if threshold == 0: #proceed only with K
+        
+        if len(cluster_list[I[0][0]]) < K:
+            print('asked number of documents to be retrieved is larger than the number of documents in the cluster; \nall documents in the cluster are retrieved')
+            return corpus.iloc[cluster_list[I[0][0]]]   
+        else:
+            DD, II = index2.search(q, K) #returning distances and indexes of the nearest documents in the cluster (sorted by distance)
+            return corpus.iloc[II[0]]
+            
+        
+    else:
+        DD, II = index2.search(q, K)
+        DD = [1 - x for x in DD] #now DD are not distances, but similarities
+        
+        if DD[0] < threshold:
+            return None
+        
+        for sim in DD:
+            if sim < threshold:
+                DD.pop(sim)
+        
+        if len(DD) < K:
+                print('number of documents that satisfy threshold similarity is less than required \(less than K\)')
+       
+        return corpus.iloc[II[0]]
+    
+    
+def retrieve_with_preclustering_faiss(string_query, k = 5, IDs_of_retrieved_docs = False):
+    vector_q = vectorize_query(string_query)
+    return ir_preclustering_faiss(vector_q.iloc[0].astype('float32'), K = k)
+
+def evaluate_retrieve_with_preclustering_faiss(position):
+    ## returns the triple (Precision, Average Precision, Normalized Discounted Cumulative Gain)
+    
+    retrieved_df = ir_preclustering_faiss(tf_idf_queries.iloc[position].astype('float32'))
+    ids_retrieved = []
+    
+    for i in range(len(retrieved_df)):
+        ids_retrieved.append(retrieved_df.iloc[i]['ID'])
+    ids_retrieved.sort()
+    
+    relevant = true_relevant_docs(queries_text['TEXT'][position])
+    ids_true_relevant = []
+    for i in range(len(relevant)):
+        ids_true_relevant.append(relevant.iloc[i].DOC_ID)
+    ids_true_relevant.sort()
+    
+    #count true positives and false positives
+    tp = 0
+    fp = 0
+    for i in ids_retrieved:
+        for j in ids_true_relevant:
+            if i == j:
+                tp += 1 
+                break
+            else:
+                if i < j:
+                    fp += 1 
+                    break
+                else:
+                    continue
+    if (tp == 0) & (fp == 0):
+        precision = 0
+    else:
+        precision = tp/(tp+fp)
+    #cannot calculate recall, since we predefined the number of retrieved documents => apriori algorithm cannot retrieve all documents
+    
+    #then calculate Average precision across retrieved documents
+    ap = apk(ids_true_relevant, ids_retrieved)
+    
+    #since we have graded relevance annotations, we can also calculate Normalized Discounted Cumulative Gain
+    list_of_ranks_of_retrieved_docs = []
+    for i in ids_retrieved:
+        if i in ids_true_relevant:
+            list_of_ranks_of_retrieved_docs.append(relevant.loc[relevant['DOC_ID'].isin([i])].RELEVANCE_LEVEL.iloc[0])
+        else:
+            list_of_ranks_of_retrieved_docs.append(0)
+
+                                               
+    list_of_ranks_of_relevant_docs = []
+    for i in ids_true_relevant:
+        list_of_ranks_of_relevant_docs.append(relevant.loc[relevant['DOC_ID'].isin([i])].RELEVANCE_LEVEL.iloc[0])
+    list_of_ranks_of_relevant_docs.sort(reverse = True)
+    
+    k=len(list_of_ranks_of_retrieved_docs)
+    list_of_ranks_of_relevant_docs = list_of_ranks_of_relevant_docs[:k]
+        
+    return precision, ap, ndcg(list_of_ranks_of_relevant_docs, list_of_ranks_of_retrieved_docs) 
+    
+    
+###########################
+## KMeans pre-clustering
+###########################
+
+#construct function, which uses query q(should be already in the vector form) as input, required similarity of the doc to be retrieved - threshold, and
+#necessary number of documents to be retrieved - K (5 most similar docs in the cluster by default)
+
+def ir_preclustering_kmeans(q, threshold = 0, K = 5):
+#     q = [q]
+    sim_to_centers = [] #array of cosine similarities of q to centers
+    retrieved_docs = [] #array of the most similar docs to be returned by the function
+    
+    for i in range(len(centers)):
+        sim_to_centers.append(cosine_similarity(q,centers[i]))
+    m = max(sim_to_centers)
+    index_of_max = [l for l, b in enumerate(sim_to_centers) if b == m] #odinal number of most similar leader => use this cluster
+    
+    sim_to_docs = [] #array of cosine similarities of q to all docs in the chosen cluster
+    for doc in cluster_list_kmeans[index_of_max[0]]:
+        sim_to_docs.append(cosine_similarity(q,tf_idf_matrix.iloc[doc]))
+        
+    ins = np.argsort(sim_to_docs) #returns the indices that would sort an array of similarities to docs in ascending order
+    ins = ins[::-1] #but we need descending (most similar in the beginning of the list)
+    
+    if threshold == 0: #proceed only with K
+        if len(ins)>=K:
+            for k in range(K):
+                retrieved_docs.append(cluster_list_kmeans[index_of_max[0]][ins[k]])
+        else:
+            K=len(ins)
+            for k in range(K):
+                retrieved_docs.append(cluster_list_kmeans[index_of_max[0]][ins[k]])
+
+        
+    else:
+        if sim_to_docs[ins[0]] < threshold:
+            print('no documents satisfy necessary level of threshold similarity')
+            return None
+        
+        for sim in sim_to_docs:
+            if sim >= threshold:
+                retrieved_docs.append(cluster_list_kmeans[index_of_max[0]][sim_to_docs.index(sim)])
+            if len(retrieved_docs) < K:
+                print('number of documents that satisfy threshold similarity is less than required \(less than K\)')
+    
+    return corpus.iloc[retrieved_docs]
+
+def retrieve_with_preclustering_kmeans(string_query, k = 5, IDs_of_retrieved_docs = False):
+    vector_q = vectorize_query(string_query)
+    return ir_preclustering_kmeans(vector_q.iloc[0].astype('float32'), K = k)
+
+def evaluate_retrieve_with_preclustering_kmeans(position):
+    ## returns the triple (Precision, Average Precision, Normalized Discounted Cumulative Gain)
+    
+    retrieved_df = ir_preclustering_kmeans(tf_idf_queries.iloc[position].astype('float32'))
+    ids_retrieved = []
+    for i in range(len(retrieved_df)):
+        ids_retrieved.append(retrieved_df.iloc[i].ID)
+    ids_retrieved.sort()
+    
+    relevant = true_relevant_docs(queries_text['TEXT'][position])
+    ids_true_relevant = []
+    for i in range(len(relevant)):
+        ids_true_relevant.append(relevant.iloc[i].DOC_ID)
+    ids_true_relevant.sort()
+    
+    #count true positives and false positives
+    tp = 0
+    fp = 0
+    for i in ids_retrieved:
+        for j in ids_true_relevant:
+            if i == j:
+                tp += 1 
+                break
+            else:
+                if i < j:
+                    fp += 1 
+                    break
+                else:
+                    continue
+    if (tp == 0) & (fp == 0):
+        precision = 0
+    else:
+        precision = tp/(tp+fp)
+    #cannot calculate recall, since we predefined the number of retrieved documents => apriori algorithm cannot retrieve all documents
+    
+    #then calculate Average precision across retrieved documents
+    ap = apk(ids_true_relevant, ids_retrieved)
+    
+    #since we have graded relevance annotations, we can also calculate Normalized Discounted Cumulative Gain
+    list_of_ranks_of_retrieved_docs = []
+    for i in ids_retrieved:
+        if i in ids_true_relevant:
+            list_of_ranks_of_retrieved_docs.append(relevant.loc[relevant['DOC_ID'].isin([i])].RELEVANCE_LEVEL.iloc[0])
+        else:
+            list_of_ranks_of_retrieved_docs.append(0)
+
+                                               
+    list_of_ranks_of_relevant_docs = []
+    for i in ids_true_relevant:
+        list_of_ranks_of_relevant_docs.append(relevant.loc[relevant['DOC_ID'].isin([i])].RELEVANCE_LEVEL.iloc[0])
+    list_of_ranks_of_relevant_docs.sort(reverse = True)
+    
+    k=len(list_of_ranks_of_retrieved_docs)
+    list_of_ranks_of_relevant_docs = list_of_ranks_of_relevant_docs[:k]
+        
+    return precision, ap, ndcg(list_of_ranks_of_relevant_docs, list_of_ranks_of_retrieved_docs) 
+
+################################################################################
+## Random Projections
+################################################################################
+
+def norm(vectors):
+    norm_vectors = []
+    if len(vectors) == 1:
+        norm_vectors.append(vectors/np.linalg.norm(vectors))
+    else:
+        for vec in vectors:
+            norm_vectors.append(vec/np.linalg.norm(vec))
+    return np.array(norm_vectors)
+
+def get_random_vectors(dim,m):
+    vectors = np.random.randn(m, dim)
+    return norm(vectors)
+
+def compute_hash(docs, rnd_vec, t):
+    hashed_doc_vectors = []
+    #for each document in document collection
+    for doc in docs:
+        hashed_dot_product = []
+        inner_product = doc.dot(rnd_vec.transpose())
+        for i in inner_product:
+            if i>t:
+                hashed_dot_product.append(1)
+            else:
+                hashed_dot_product.append(0)
+        hashed_doc_vectors.append(hashed_dot_product)
+    return np.array(hashed_doc_vectors)
+
+
+
+################################################################################
 ## Evaluation metrics
 ################################################################################
 
@@ -305,6 +750,8 @@ def ndcg(reference, hypothesis):
         return 0
     else:
         return dcg(hypothesis)/dcg(reference)
+    
+    
 
 ################################################################################
 ## Query retrieval
@@ -439,33 +886,61 @@ def full_evaluation(queries, docs, k=10, random_projections = False):
 
     return evaluation
 
-################################################################################
-## Random Projections
-################################################################################
+def evaluate_preclustering():
+    evaluation = queries_text.copy()
+    evaluation.insert(2, "Precision", 0)
+    evaluation.insert(3, "Average Precision", 0)
+    evaluation.insert(4, "nDCG", 0)
+    
+    for i in range(len(evaluation)):
 
-def norm(vectors):
-    norm_vectors = []
-    if len(vectors) == 1:
-        norm_vectors.append(vectors/np.linalg.norm(vectors))
-    else:
-        for vec in vectors:
-            norm_vectors.append(vec/np.linalg.norm(vec))
-    return np.array(norm_vectors)
+        p, a, n = evaluate_retrieve_with_preclustering(i,)
+        evaluation.loc[i, 'Precision'] = p
+        evaluation.loc[i, 'Average Precision'] = a
+        evaluation.loc[i, 'nDCG'] = n
+    
+    print('Average precision across all queries = ' + str(evaluation['Precision'].mean()))
+    print('Mean Average Precision = ' + str(evaluation['Average Precision'].mean()))
+    print('Average nDCG = ' + str(evaluation['nDCG'].mean()))
+    
+    return evaluation
 
-def get_random_vectors(dim,m):
-    vectors = np.random.randn(m, dim)
-    return norm(vectors)
+def evaluate_preclustering_faiss():
+    evaluation = queries_text.copy()
+    evaluation.insert(2, "Precision", 0)
+    evaluation.insert(3, "Average Precision", 0)
+    evaluation.insert(4, "nDCG", 0)
+    
+    for i in range(len(evaluation)):
 
-def compute_hash(docs, rnd_vec, t):
-    hashed_doc_vectors = []
-    #for each document in document collection
-    for doc in docs:
-        hashed_dot_product = []
-        inner_product = doc.dot(rnd_vec.transpose())
-        for i in inner_product:
-            if i>t:
-                hashed_dot_product.append(1)
-            else:
-                hashed_dot_product.append(0)
-        hashed_doc_vectors.append(hashed_dot_product)
-    return np.array(hashed_doc_vectors)
+        p, a, n = evaluate_retrieve_with_preclustering_faiss(i)
+        evaluation.loc[i, 'Precision'] = p
+        evaluation.loc[i, 'Average Precision'] = a
+        evaluation.loc[i, 'nDCG'] = n
+    
+    print('Average precision across all queries = ' + str(evaluation['Precision'].mean()))
+    print('Mean Average Precision = ' + str(evaluation['Average Precision'].mean()))
+    print('Average nDCG = ' + str(evaluation['nDCG'].mean()))
+    
+    return evaluation
+
+
+def evaluate_preclustering_kmeans():
+    evaluation = queries_text.copy()
+    evaluation.insert(2, "Precision", 0)
+    evaluation.insert(3, "Average Precision", 0)
+    evaluation.insert(4, "nDCG", 0)
+    
+    for i in range(len(evaluation)):
+
+        p, a, n = evaluate_retrieve_with_preclustering_kmeans(i)
+        evaluation.loc[i, 'Precision'] = p
+        evaluation.loc[i, 'Average Precision'] = a
+        evaluation.loc[i, 'nDCG'] = n
+    
+    print('Average precision across all queries = ' + str(evaluation['Precision'].mean()))
+    print('Mean Average Precision = ' + str(evaluation['Average Precision'].mean()))
+    print('Average nDCG = ' + str(evaluation['nDCG'].mean()))
+    
+    return evaluation
+
